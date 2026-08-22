@@ -37,7 +37,7 @@ const NEW_MYSQL_URL = process.env.NEW_MYSQL_URL;
 const ACCESS_KEY = process.env.MIGRATION_ACCESS_KEY || null;
 
 const job = {
-  status: "idle",       // idle | missing-config | running | success | error | success-with-errors
+  status: "idle",       // idle | missing-config | scanning | running | success | error | success-with-errors
   message: "Starting up...",
   tablesTotal: 0,
   tablesDone: 0,
@@ -47,6 +47,15 @@ const job = {
   failedTables: [],
   startedAt: null,
   finishedAt: null,
+  /* Snapshot taken once, up front, before any copying starts. Everything
+     the migration targets is fixed at this point — rows inserted into the
+     source DB *after* the scan (this is a live table) are intentionally
+     NOT picked up, so the total/ETA stays meaningful and we don't chase
+     a moving target. */
+  totalRowsPlanned: 0,
+  tableRowPlan: {},   // { tableName: rowCountAtScanTime }
+  etaSeconds: null,
+  rowsPerSecond: 0,
   log: []
 };
 
@@ -105,6 +114,44 @@ function buildInsertSql(table, cols, rows, tgt) {
   return `INSERT INTO \`${table}\` (${colList}) VALUES ${valueLines.join(",")}`;
 }
 
+/* Finds the PRIMARY KEY column(s) for a table so pagination can use a
+   stable ORDER BY. Without this, OFFSET-based paging over a table that's
+   still being written to (rows inserted/deleted mid-scan) can re-fetch
+   or skip rows as they shift position — that's what caused duplicate-key
+   errors and lost/re-counted rows during auth_data's migration. */
+async function getPrimaryKeyCols(src, table) {
+  const [rows] = await src.query(
+    `SELECT COLUMN_NAME FROM information_schema.KEY_COLUMN_USAGE
+     WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'PRIMARY'
+     ORDER BY ORDINAL_POSITION`,
+    [table]
+  );
+  return rows.map(r => r.COLUMN_NAME);
+}
+
+/* Recomputes the live rows/sec rate and ETA off the fixed totalRowsPlanned
+   snapshot, and refreshes job.eta fields. Called periodically while
+   copying so the status page stays live without recalculating on every
+   single row. */
+function updateEta() {
+  if (!job.startedAt || !job.totalRowsPlanned) return;
+  const elapsedSec = (Date.now() - new Date(job.startedAt).getTime()) / 1000;
+  const processed = job.rowsCopied + job.rowsSkipped;
+  if (elapsedSec <= 0 || processed <= 0) return;
+  job.rowsPerSecond = Math.round((processed / elapsedSec) * 10) / 10;
+  const remaining = Math.max(0, job.totalRowsPlanned - processed);
+  job.etaSeconds = job.rowsPerSecond > 0 ? Math.round(remaining / job.rowsPerSecond) : null;
+}
+
+function formatDuration(sec) {
+  if (sec === null || sec === undefined) return "-";
+  if (sec < 60) return `${sec}s`;
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return `${m}m ${s}s`;
+  const h = Math.floor(m / 60), rm = m % 60;
+  return `${h}h ${rm}m`;
+}
+
 function checkKey(req, res) {
   if (!ACCESS_KEY) return true;
   if (req.query.key === ACCESS_KEY) return true;
@@ -137,10 +184,12 @@ app.get("/", (req, res) => {
 </head>
 <body>
   <h1>🔄 DB Migration Status</h1>
-  <p>Status: <b class="${job.status === 'success' ? 'ok' : job.status === 'error' ? 'err' : job.status === 'success-with-errors' ? 'run' : 'run'}">${job.status}</b></p>
+  <p>Status: <b class="${job.status === 'success' ? 'ok' : job.status === 'error' ? 'err' : 'run'}">${job.status}</b></p>
+  ${job.totalRowsPlanned ? `<p><small>Planned at scan time: ${job.totalRowsPlanned} rows across ${job.tablesTotal} tables.</small></p>` : ""}
   <p>${job.message}</p>
-  <div class="bar-bg"><div class="bar" style="width:${job.tablesTotal ? Math.round(job.tablesDone / job.tablesTotal * 100) : 0}%"></div></div>
-  <p>Tables: ${job.tablesDone} / ${job.tablesTotal} &nbsp; | &nbsp; Rows copied: ${job.rowsCopied} &nbsp; | &nbsp; Rows skipped: ${job.rowsSkipped}</p>
+  <div class="bar-bg"><div class="bar" style="width:${job.totalRowsPlanned ? Math.round((job.rowsCopied + job.rowsSkipped) / job.totalRowsPlanned * 100) : (job.tablesTotal ? Math.round(job.tablesDone / job.tablesTotal * 100) : 0)}%"></div></div>
+  <p>Tables: ${job.tablesDone} / ${job.tablesTotal} &nbsp; | &nbsp; Rows: ${job.rowsCopied + job.rowsSkipped} / ${job.totalRowsPlanned || "?"} planned &nbsp; | &nbsp; Copied: ${job.rowsCopied} &nbsp; | &nbsp; Skipped: ${job.rowsSkipped}</p>
+  <p>Speed: ${job.rowsPerSecond || 0} rows/sec &nbsp; | &nbsp; ETA: ${formatDuration(job.etaSeconds)}</p>
   <p>Current table: ${job.currentTable || "-"}</p>
   <p>Started: ${job.startedAt || "-"} &nbsp; Finished: ${job.finishedAt || "-"}</p>
   ${job.failedTables.length ? `<p class="err">Tables with issues: ${job.failedTables.join(", ")}</p>` : ""}
@@ -196,6 +245,30 @@ async function runMigration() {
     job.tablesTotal = tables.length;
     logLine(`Found ${tables.length} tables to migrate.`);
 
+    /* ---- Pre-scan: count every table BEFORE touching any data ----
+       This fixes the total size of the job up front. Rows are still
+       being written to the source DB during a long migration (it's
+       live), but anything inserted after this point is intentionally
+       excluded from the count and from what gets copied — we migrate
+       exactly the snapshot we planned, not a moving target, so the
+       total and ETA stay accurate throughout the run. */
+    job.status = "scanning";
+    job.message = `Calculating total rows across ${tables.length} tables...`;
+    logLine(job.message);
+
+    for (const { t: table } of tables) {
+      const [[{ c }]] = await withRetry(
+        () => src.query(`SELECT COUNT(*) AS c FROM \`${table}\``),
+        `count ${table}`
+      );
+      job.tableRowPlan[table] = c;
+      job.totalRowsPlanned += c;
+    }
+    logLine(`Scan complete: ${job.totalRowsPlanned} rows planned across ${tables.length} tables.`);
+
+    job.status = "running";
+    job.message = "Starting copy...";
+
     for (const { t: table } of tables) {
       job.currentTable = table;
       job.message = `Copying table: ${table}`;
@@ -221,17 +294,31 @@ async function runMigration() {
           logLine(`  (skipping generated column(s) on ${table}: ${[...generatedCols].join(", ")})`);
         }
 
+        /* Order by primary key so OFFSET pagination is stable even while
+           the source table keeps getting new rows written to it mid-scan.
+           Without this, rows can shift position between pages and get
+           re-fetched (duplicate-key errors) or skipped entirely. */
+        const pkCols = await getPrimaryKeyCols(src, table);
+        const orderClause = pkCols.length
+          ? `ORDER BY ${pkCols.map(c => `\`${c}\``).join(", ")}`
+          : "";
+        if (!pkCols.length) {
+          logLine(`  (no PRIMARY KEY found on ${table} — pagination may be unstable if this table is written to during the migration)`);
+        }
+
+        const rowsPlanned = job.tableRowPlan[table] || 0;
         let batchSize = 500;
         let offset = 0;
         let tableRows = 0;
         let tableSkipped = 0;
 
-        while (true) {
+        while (offset < rowsPlanned) {
+          const take = Math.min(batchSize, rowsPlanned - offset);
           const [rows] = await withRetry(
-            () => src.query(`SELECT * FROM \`${table}\` LIMIT ${batchSize} OFFSET ${offset}`),
+            () => src.query(`SELECT * FROM \`${table}\` ${orderClause} LIMIT ${take} OFFSET ${offset}`),
             `select ${table} offset ${offset}`
           );
-          if (!rows.length) break;
+          if (!rows.length) break; // fewer rows now than at scan time (deletes) — nothing more to copy
 
           const cols = Object.keys(rows[0]).filter(c => !generatedCols.has(c));
 
@@ -269,7 +356,8 @@ async function runMigration() {
             offset += rows.length;
           }
 
-          if (rows.length < batchSize) break;
+          updateEta();
+          if (rows.length < take) break; // fewer rows now than planned (deletes) — table exhausted
         }
 
         logLine(`  → ${table}: ${tableRows} rows copied${tableSkipped ? `, ${tableSkipped} skipped` : ""}.`);
