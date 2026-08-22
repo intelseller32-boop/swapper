@@ -261,8 +261,11 @@ async function runMigration() {
         () => src.query(`SELECT COUNT(*) AS c FROM \`${table}\``),
         `count ${table}`
       );
-      job.tableRowPlan[table] = c;
-      job.totalRowsPlanned += c;
+      const count = Number(c); // mysql2 returns COUNT(*) as a string (bigNumberStrings
+                                // is on) — must convert or `+=` below silently
+                                // concatenates strings instead of summing numbers
+      job.tableRowPlan[table] = count;
+      job.totalRowsPlanned += count;
     }
     logLine(`Scan complete: ${job.totalRowsPlanned} rows planned across ${tables.length} tables.`);
 
